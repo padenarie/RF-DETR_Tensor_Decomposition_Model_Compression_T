@@ -180,3 +180,5 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 rf-detr-seg-nano.pt
+data/processed/football_play_decomposed.mp4
+/data/processed
