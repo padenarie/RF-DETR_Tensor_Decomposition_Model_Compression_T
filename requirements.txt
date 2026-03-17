@@ -1,0 +1,29 @@
+# Core ML framework
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Object detection & segmentation
+supervision>=0.27.0
+# rfdetr_pierre is in src/ (local install or add src/ to PYTHONPATH)
+
+# Tensor decomposition
+tensorly>=0.8.0
+# tntorch_pierre is a custom fork in src/ (add src/ to PYTHONPATH)
+
+# Numerical computing
+numpy>=1.26.0
+scipy>=1.11.0
+
+# Image & video processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# Visualisation
+matplotlib>=3.7.0
+
+# Utilities
+tqdm>=4.65.0
+
+# (Optional) Jupyter
+notebook>=7.0.0
+ipywidgets>=8.0.0
