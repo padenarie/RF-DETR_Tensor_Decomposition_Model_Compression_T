@@ -9,6 +9,7 @@
 
 import collections.abc
 import math
+import weakref
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -725,6 +726,111 @@ class TTDinov2WithRegistersMLP(nn.Module):
         return int(sum(core.numel() for core in self.tt_tensor.cores))
 
 
+class TTLinear(nn.Module):
+    """TT-backed replacement for a single nn.Linear layer."""
+
+    VALID_CACHE_POLICIES = {"none", "cpu", "gpu"}
+
+    def __init__(
+        self,
+        tt_tensor,
+        bias: Optional[torch.Tensor],
+        cache_policy: str = "none",
+    ) -> None:
+        super().__init__()
+        self.tt_tensor = tt_tensor
+        self.set_cache_policy(cache_policy)
+
+        if bias is not None:
+            self.register_buffer("bias", bias)
+        else:
+            self.bias = None
+
+        self._cached_weight: Optional[torch.Tensor] = None
+        self._cache_device: Optional[torch.device] = None
+        self._cache_dtype: Optional[torch.dtype] = None
+
+    @classmethod
+    def from_dense_linear(
+        cls,
+        linear: nn.Linear,
+        eps: Optional[float] = None,
+        ranks_tt: Optional[List[int]] = None,
+        ranks_cp: Optional[int] = None,
+        max_iter: Optional[int] = None,
+        tol: Optional[float] = None,
+        cache_policy: str = "none",
+    ) -> "TTLinear":
+        try:
+            import tntorch_pierre as tnp
+        except ImportError as exc:
+            raise ImportError("tntorch_pierre is required to build TT-backed linear layers.") from exc
+
+        with torch.no_grad():
+            weight = linear.weight.detach().clone()
+
+            tensor_kwargs = {}
+            if eps is not None:
+                tensor_kwargs["eps"] = eps
+            if ranks_tt is not None:
+                tensor_kwargs["ranks_tt"] = ranks_tt
+            if ranks_cp is not None:
+                tensor_kwargs["ranks_cp"] = ranks_cp
+            if max_iter is not None:
+                tensor_kwargs["max_iter"] = max_iter
+            if tol is not None:
+                tensor_kwargs["tol"] = tol
+
+            tt_tensor = tnp.Tensor(weight, **tensor_kwargs)
+            bias = linear.bias.detach().clone() if linear.bias is not None else None
+            return cls(tt_tensor=tt_tensor, bias=bias, cache_policy=cache_policy)
+
+    def set_cache_policy(self, cache_policy: str) -> None:
+        cache_policy = cache_policy.lower()
+        if cache_policy not in self.VALID_CACHE_POLICIES:
+            raise ValueError(
+                f"Invalid cache_policy='{cache_policy}'. "
+                f"Expected one of {sorted(self.VALID_CACHE_POLICIES)}."
+            )
+        self.cache_policy = cache_policy
+        self.clear_cache()
+
+    def clear_cache(self) -> None:
+        self._cached_weight = None
+        self._cache_device = None
+        self._cache_dtype = None
+
+    def _dense_weight(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        if self.cache_policy == "gpu":
+            cache_hit = (
+                self._cached_weight is not None
+                and self._cache_device == device
+                and self._cache_dtype == dtype
+            )
+            if not cache_hit:
+                self._cached_weight = self.tt_tensor.torch().to(device=device, dtype=dtype)
+                self._cache_device = device
+                self._cache_dtype = dtype
+            return self._cached_weight
+
+        if self.cache_policy == "cpu":
+            if self._cached_weight is None:
+                self._cached_weight = self.tt_tensor.torch().to(device="cpu").contiguous()
+                self._cache_device = torch.device("cpu")
+                self._cache_dtype = self._cached_weight.dtype
+            return self._cached_weight.to(device=device, dtype=dtype)
+
+        return self.tt_tensor.torch().to(device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self._dense_weight(dtype=x.dtype, device=x.device)
+        bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
+        return nn.functional.linear(x, weight, bias)
+
+    def tt_numel(self) -> int:
+        return int(sum(core.numel() for core in self.tt_tensor.cores))
+
+
 def build_tt_dinov2_mlp(
     mlp: Dinov2WithRegistersMLP,
     eps: Optional[float] = None,
@@ -741,6 +847,809 @@ def build_tt_dinov2_mlp(
         ranks_cp=ranks_cp,
         max_iter=max_iter,
         tol=tol,
+        cache_policy=cache_policy,
+    )
+
+
+def build_tt_linear(
+    linear: nn.Linear,
+    eps: Optional[float] = None,
+    ranks_tt: Optional[List[int]] = None,
+    ranks_cp: Optional[int] = None,
+    max_iter: Optional[int] = None,
+    tol: Optional[float] = None,
+    cache_policy: str = "none",
+) -> TTLinear:
+    return TTLinear.from_dense_linear(
+        linear=linear,
+        eps=eps,
+        ranks_tt=ranks_tt,
+        ranks_cp=ranks_cp,
+        max_iter=max_iter,
+        tol=tol,
+        cache_policy=cache_policy,
+    )
+
+
+def _cp_decompose_tensor(
+    tensor: torch.Tensor,
+    rank: int,
+    n_iter_max: int = 100,
+    tol: float = 1e-8,
+    init: Union[str, Tuple[str, ...], List[str]] = "svd",
+    random_state: int = 0,
+    als_init_modes: Union[Tuple[str, ...], List[str]] = ("svd", "hosvd", "random"),
+    als_random_starts: int = 3,
+    als_verbose: bool = False,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    """Compute a CP decomposition on CPU and return torch tensors.
+
+    Supports multistart ALS with init modes from {"svd", "hosvd", "random"}.
+    """
+    try:
+        import numpy as np
+        import tensorly as tl
+        from tensorly.decomposition import parafac
+        from tensorly.cp_tensor import cp_to_tensor
+        from tensorly.base import unfold
+    except ImportError as exc:
+        raise ImportError("tensorly is required to build CP-backed layers.") from exc
+
+    data = tensor.detach().cpu().numpy()
+    rank_eff = max(1, int(rank)) # rank_eff = max(1, min(int(rank), int(min(data.shape))))
+    work_dtype = np.float32 if tensor.dtype in (torch.float16, torch.float32, torch.bfloat16) else np.float64
+    data = data.astype(work_dtype, copy=False)
+
+    def _make_hosvd_init() -> Tuple[np.ndarray, List[np.ndarray]]:
+        factors = []
+        for mode in range(data.ndim):
+            U, _, _ = np.linalg.svd(unfold(data, mode), full_matrices=False)
+            r_here = min(rank_eff, U.shape[1])
+            f = U[:, :r_here]
+            if r_here < rank_eff:
+                pad = np.zeros((U.shape[0], rank_eff - r_here), dtype=work_dtype)
+                f = np.concatenate([f, pad], axis=1)
+            factors.append(np.asarray(f, dtype=work_dtype))
+        weights = np.ones(rank_eff, dtype=work_dtype)
+        return weights, factors
+
+    def _rel_err(cp_obj) -> float:
+        rec = tl.to_numpy(cp_to_tensor(cp_obj)).astype(work_dtype, copy=False)
+        return float(np.linalg.norm(rec - data) / (np.linalg.norm(data) + 1e-12))
+
+    explicit_init = None
+    if isinstance(init, str):
+        init_modes = [init.lower()]
+    elif isinstance(init, (list, tuple)):
+        if len(init) == 2 and not all(isinstance(x, str) for x in init):
+            # TensorLy CP init mapping: (weights, factors)
+            explicit_init = init
+            init_modes = []
+        else:
+            init_modes = [str(m).lower() for m in init]
+    else:
+        explicit_init = init
+        init_modes = []
+
+    if init_modes == ["hosvd"]:
+        init_modes = ["hosvd", "random"]
+
+    # Default multistart policy when using a single string init.
+    if isinstance(init, str) and init.lower() == "svd" and als_init_modes:
+        init_modes = [str(m).lower() for m in als_init_modes]
+
+    candidates = []
+    if explicit_init is not None:
+        candidates.append(("custom", explicit_init, int(random_state)))
+    else:
+        if "svd" in init_modes:
+            candidates.append(("svd", "svd", int(random_state)))
+        if "hosvd" in init_modes:
+            candidates.append(("hosvd", _make_hosvd_init(), int(random_state) + 101))
+
+        n_rand = int(max(0, als_random_starts if "random" in init_modes else 0))
+        for i in range(n_rand):
+            candidates.append((f"random_{i + 1}", "random", int(random_state) + 1000 + i))
+
+    if not candidates:
+        candidates.append(("svd", "svd", int(random_state)))
+
+    best_cp = None
+    best_err = np.inf
+    for name, init_obj, rs in candidates:
+        try:
+            cp = parafac(
+                tl.tensor(data),
+                rank=rank_eff,
+                n_iter_max=max(10, int(n_iter_max)),
+                tol=max(float(tol), 1e-12),
+                init=init_obj,
+                normalize_factors=False,
+                random_state=rs,
+                verbose=bool(als_verbose),
+            )
+            err = _rel_err(cp)
+            if als_verbose:
+                logger.info(f"[CP ALS init={name}] rel_err={err:.6f}")
+            if err < best_err:
+                best_err = err
+                best_cp = cp
+        except Exception as exc:
+            if als_verbose:
+                logger.info(f"[CP ALS init={name}] failed ({exc})")
+
+    if best_cp is None:
+        raise RuntimeError("All CP ALS initializations failed")
+
+    if als_verbose:
+        logger.info(f"[CP ALS] best rel_err={best_err:.6f}")
+
+    weights = best_cp.weights if best_cp.weights is not None else np.ones(rank_eff, dtype=work_dtype)
+    factors = best_cp.factors
+
+    torch_dtype = tensor.dtype if tensor.dtype.is_floating_point else torch.float32
+    weight_t = torch.from_numpy(np.asarray(weights)).to(dtype=torch_dtype).contiguous()
+    factor_t = [torch.from_numpy(np.asarray(f)).to(dtype=torch_dtype).contiguous() for f in factors]
+    return weight_t, factor_t
+
+
+def _cp_reconstruct_from_factors(cp_weights: torch.Tensor, cp_factors: List[torch.Tensor]) -> torch.Tensor:
+    if len(cp_factors) == 2:
+        return torch.einsum("r,or,ir->oi", cp_weights, cp_factors[0], cp_factors[1]).contiguous()
+    if len(cp_factors) == 3:
+        return torch.einsum("r,ar,br,cr->abc", cp_weights, cp_factors[0], cp_factors[1], cp_factors[2]).contiguous()
+    raise RuntimeError(f"Unsupported CP order={len(cp_factors)} for reconstruction")
+
+
+class CPSharedTensorStore(nn.Module):
+    """Shared CP decomposition of a stacked 3D tensor [K, R, C]."""
+
+    VALID_CACHE_POLICIES = {"none", "cpu", "gpu"}
+
+    def __init__(self, cp_weights: torch.Tensor, cp_factors: List[torch.Tensor], cache_policy: str = "none") -> None:
+        super().__init__()
+        self.register_buffer("cp_weights", cp_weights)
+        self.cp_order = int(len(cp_factors))
+        for idx, factor in enumerate(cp_factors):
+            self.register_buffer(f"cp_factor_{idx}", factor)
+
+        self._cached_stacked: Optional[torch.Tensor] = None
+        self._cache_device: Optional[torch.device] = None
+        self._cache_dtype: Optional[torch.dtype] = None
+        self.set_cache_policy(cache_policy)
+
+    def _factors(self) -> List[torch.Tensor]:
+        return [getattr(self, f"cp_factor_{i}") for i in range(self.cp_order)]
+
+    def set_cache_policy(self, cache_policy: str) -> None:
+        cache_policy = cache_policy.lower()
+        if cache_policy not in self.VALID_CACHE_POLICIES:
+            raise ValueError(
+                f"Invalid cache_policy='{cache_policy}'. "
+                f"Expected one of {sorted(self.VALID_CACHE_POLICIES)}."
+            )
+        self.cache_policy = cache_policy
+        self.clear_cache()
+
+    def clear_cache(self) -> None:
+        self._cached_stacked = None
+        self._cache_device = None
+        self._cache_dtype = None
+
+    def _reconstruct_stacked(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        factors = [f.to(device=device, dtype=dtype) for f in self._factors()]
+        weights = self.cp_weights.to(device=device, dtype=dtype)
+        if len(factors) != 3:
+            raise RuntimeError(f"Expected 3 CP factors for stacked tensor, got {len(factors)}")
+        return torch.einsum("r,ar,br,cr->abc", weights, factors[0], factors[1], factors[2]).contiguous()
+
+    def stacked(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        if self.cache_policy == "gpu":
+            cache_hit = (
+                self._cached_stacked is not None
+                and self._cache_device == device
+                and self._cache_dtype == dtype
+            )
+            if not cache_hit:
+                self._cached_stacked = self._reconstruct_stacked(dtype=dtype, device=device)
+                self._cache_device = device
+                self._cache_dtype = dtype
+            return self._cached_stacked
+
+        if self.cache_policy == "cpu":
+            if self._cached_stacked is None:
+                self._cached_stacked = self._reconstruct_stacked(
+                    dtype=self.cp_weights.dtype,
+                    device=torch.device("cpu"),
+                )
+                self._cache_device = torch.device("cpu")
+                self._cache_dtype = self._cached_stacked.dtype
+            return self._cached_stacked.to(device=device, dtype=dtype)
+
+        return self._reconstruct_stacked(dtype=dtype, device=device)
+
+
+class CPSharedSlicedLinear(nn.Module):
+    """Linear layer view into a slice of CPSharedTensorStore stacked tensor."""
+
+    def __init__(
+        self,
+        shared_store: CPSharedTensorStore,
+        slice_idx: int,
+        rows: int,
+        cols: int,
+        transpose_slice: bool,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        super().__init__()
+        self._shared_store_ref = weakref.ref(shared_store)
+        self.slice_idx = int(slice_idx)
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.transpose_slice = bool(transpose_slice)
+
+        if bias is not None:
+            self.register_buffer("bias", bias)
+        else:
+            self.bias = None
+
+    def materialize_weight(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        shared = self._shared_store_ref()
+        if shared is None:
+            raise RuntimeError("Shared CP store no longer exists")
+
+        stacked = shared.stacked(dtype=dtype, device=device)
+        w = stacked[self.slice_idx, : self.rows, : self.cols]
+        if self.transpose_slice:
+            w = w.T
+        return w.contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.materialize_weight(dtype=x.dtype, device=x.device)
+        bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
+        return nn.functional.linear(x, weight, bias)
+
+
+def _extract_linear_weight_for_stack(linear_module: nn.Module, transpose: bool = False) -> torch.Tensor:
+    if hasattr(linear_module, "weight") and isinstance(getattr(linear_module, "weight"), torch.Tensor):
+        w = linear_module.weight.detach().clone()
+    elif hasattr(linear_module, "materialize_weight"):
+        w = linear_module.materialize_weight(dtype=torch.float32, device=torch.device("cpu")).detach().clone()
+    else:
+        raise TypeError(f"Unsupported linear module type for stacking: {type(linear_module).__name__}")
+
+    return w.T if transpose else w
+
+
+def _replace_linear_with_shared_cp_slice(
+    parent_module: nn.Module,
+    attr_name: str,
+    shared_store: CPSharedTensorStore,
+    slice_idx: int,
+    rows: int,
+    cols: int,
+    transpose_slice: bool,
+) -> None:
+    old_mod = getattr(parent_module, attr_name)
+    bias = old_mod.bias.detach().clone() if hasattr(old_mod, "bias") and old_mod.bias is not None else None
+    new_mod = CPSharedSlicedLinear(
+        shared_store=shared_store,
+        slice_idx=slice_idx,
+        rows=rows,
+        cols=cols,
+        transpose_slice=transpose_slice,
+        bias=bias,
+    )
+    setattr(parent_module, attr_name, new_mod)
+
+
+def cp_approx_layer_joint_tensor(
+    layer,
+    cp_rank: int,
+    n_iter_max: int = 100,
+    tol: float = 1e-8,
+    init: Union[str, Tuple[str, ...], List[str]] = "svd",
+    random_state: int = 0,
+    als_init_modes: Union[Tuple[str, ...], List[str]] = ("svd", "hosvd", "random"),
+    als_random_starts: int = 3,
+    als_verbose: bool = False,
+    cache_policy: str = "none",
+    include_mlp: bool = True,
+    include_attention: bool = True,
+) -> int:
+    """Approximate selected weights in one layer using one shared CP stack.
+
+    Replaces target linears with CPSharedSlicedLinear modules that reference a
+    shared decomposed tensor store (no dense write-back).
+    """
+    entries = []
+
+    if include_mlp:
+        mlp = layer.mlp
+        entries.append(
+            {
+                "name": "mlp.fc1",
+                "parent": mlp,
+                "attr": "fc1",
+                "matrix": _extract_linear_weight_for_stack(mlp.fc1, transpose=False),
+                "is_transposed": False,
+            }
+        )
+        entries.append(
+            {
+                "name": "mlp.fc2_t",
+                "parent": mlp,
+                "attr": "fc2",
+                "matrix": _extract_linear_weight_for_stack(mlp.fc2, transpose=True),
+                "is_transposed": True,
+            }
+        )
+
+    if include_attention:
+        attn_self = layer.attention.attention
+        attn_out = layer.attention.output
+        for name in ["query", "key", "value"]:
+            mod = getattr(attn_self, name)
+            entries.append(
+                {
+                    "name": f"attn.{name}",
+                    "parent": attn_self,
+                    "attr": name,
+                    "matrix": _extract_linear_weight_for_stack(mod, transpose=False),
+                    "is_transposed": False,
+                }
+            )
+        if hasattr(attn_out, "dense"):
+            mod = attn_out.dense
+            entries.append(
+                {
+                    "name": "attn.out",
+                    "parent": attn_out,
+                    "attr": "dense",
+                    "matrix": _extract_linear_weight_for_stack(mod, transpose=False),
+                    "is_transposed": False,
+                }
+            )
+
+    if not entries:
+        return 0
+
+    max_rows = max(int(e["matrix"].shape[0]) for e in entries)
+    max_cols = max(int(e["matrix"].shape[1]) for e in entries)
+    stack_dtype = entries[0]["matrix"].dtype
+
+    stacked = torch.zeros((len(entries), max_rows, max_cols), dtype=stack_dtype)
+    for i, e in enumerate(entries):
+        mat = e["matrix"]
+        r, c = int(mat.shape[0]), int(mat.shape[1])
+        stacked[i, :r, :c] = mat
+
+    cp_weights, cp_factors = _cp_decompose_tensor(
+        tensor=stacked,
+        rank=cp_rank,
+        n_iter_max=n_iter_max,
+        tol=tol,
+        init=init,
+        random_state=random_state,
+        als_init_modes=als_init_modes,
+        als_random_starts=als_random_starts,
+        als_verbose=als_verbose,
+    )
+
+    shared_store = CPSharedTensorStore(cp_weights=cp_weights, cp_factors=cp_factors, cache_policy=cache_policy)
+    layer._cp_layer_joint_store = shared_store
+
+    updated = 0
+    for i, e in enumerate(entries):
+        mat = e["matrix"]
+        r, c = int(mat.shape[0]), int(mat.shape[1])
+        _replace_linear_with_shared_cp_slice(
+            parent_module=e["parent"],
+            attr_name=e["attr"],
+            shared_store=shared_store,
+            slice_idx=i,
+            rows=r,
+            cols=c,
+            transpose_slice=bool(e["is_transposed"]),
+        )
+        updated += 1
+
+    return updated
+
+
+def cp_approx_global_mlp_tensor(
+    layers,
+    layer_ids: List[int],
+    cp_rank: int,
+    n_iter_max: int = 100,
+    tol: float = 1e-8,
+    init: Union[str, Tuple[str, ...], List[str]] = "svd",
+    random_state: int = 0,
+    als_init_modes: Union[Tuple[str, ...], List[str]] = ("svd", "hosvd", "random"),
+    als_random_starts: int = 3,
+    als_verbose: bool = False,
+    cache_policy: str = "none",
+) -> int:
+    """Approximate selected MLP fc1/fc2 matrices with one shared global CP stack.
+
+    Replaces each selected layer's fc1/fc2 with CPSharedSlicedLinear modules that
+    reference a single shared decomposed tensor store.
+    """
+    if not layer_ids:
+        return 0
+
+    mats = []
+    refs = []
+    for idx in layer_ids:
+        mlp = layers[idx].mlp
+        w1 = _extract_linear_weight_for_stack(mlp.fc1, transpose=False)
+        w2_t = _extract_linear_weight_for_stack(mlp.fc2, transpose=True)
+
+        mats.append(w1)
+        refs.append((mlp, "fc1", False))
+        mats.append(w2_t)
+        refs.append((mlp, "fc2", True))
+
+    max_rows = max(int(m.shape[0]) for m in mats)
+    max_cols = max(int(m.shape[1]) for m in mats)
+    stack_dtype = mats[0].dtype
+
+    stacked = torch.zeros((len(mats), max_rows, max_cols), dtype=stack_dtype)
+    for i, m in enumerate(mats):
+        r, c = int(m.shape[0]), int(m.shape[1])
+        stacked[i, :r, :c] = m
+
+    cp_weights, cp_factors = _cp_decompose_tensor(
+        tensor=stacked,
+        rank=cp_rank,
+        n_iter_max=n_iter_max,
+        tol=tol,
+        init=init,
+        random_state=random_state,
+        als_init_modes=als_init_modes,
+        als_random_starts=als_random_starts,
+        als_verbose=als_verbose,
+    )
+
+    shared_store = CPSharedTensorStore(cp_weights=cp_weights, cp_factors=cp_factors, cache_policy=cache_policy)
+    layers[0]._cp_global_mlp_store = shared_store
+
+    updated = 0
+    for i, m in enumerate(mats):
+        parent, attr, is_transposed = refs[i]
+        r, c = int(m.shape[0]), int(m.shape[1])
+        _replace_linear_with_shared_cp_slice(
+            parent_module=parent,
+            attr_name=attr,
+            shared_store=shared_store,
+            slice_idx=i,
+            rows=r,
+            cols=c,
+            transpose_slice=bool(is_transposed),
+        )
+        updated += 1
+
+    return updated
+
+
+class CPDinov2WithRegistersMLP(nn.Module):
+    """CP-backed replacement for Dinov2WithRegistersMLP with cache policy support."""
+
+    VALID_CACHE_POLICIES = {"none", "cpu", "gpu"}
+
+    def __init__(
+        self,
+        activation,
+        fc1_bias: torch.Tensor,
+        fc2_bias: torch.Tensor,
+        cp_weights: torch.Tensor,
+        cp_factors: List[torch.Tensor],
+        cache_policy: str = "none",
+    ) -> None:
+        super().__init__()
+        self.activation = activation
+        self.register_buffer("cp_weights", cp_weights)
+        self.cp_order = int(len(cp_factors))
+        for idx, factor in enumerate(cp_factors):
+            self.register_buffer(f"cp_factor_{idx}", factor)
+
+        self.set_cache_policy(cache_policy)
+
+        self.register_buffer("fc1_bias", fc1_bias)
+        self.register_buffer("fc2_bias", fc2_bias)
+
+        self._cached_fc1_weight: Optional[torch.Tensor] = None
+        self._cached_fc2_weight: Optional[torch.Tensor] = None
+        self._cache_device: Optional[torch.device] = None
+        self._cache_dtype: Optional[torch.dtype] = None
+
+    @classmethod
+    def from_dense_mlp(
+        cls,
+        mlp: Dinov2WithRegistersMLP,
+        cp_rank: int,
+        n_iter_max: int = 100,
+        tol: float = 1e-8,
+        init: Union[str, Tuple[str, ...], List[str]] = "svd",
+        random_state: int = 0,
+        als_init_modes: Union[Tuple[str, ...], List[str]] = ("svd", "hosvd", "random"),
+        als_random_starts: int = 3,
+        als_verbose: bool = False,
+        cache_policy: str = "none",
+    ) -> "CPDinov2WithRegistersMLP":
+        with torch.no_grad():
+            w1 = mlp.fc1.weight.detach().clone()
+            w2_t = mlp.fc2.weight.detach().clone().T
+            stacked = torch.stack([w1, w2_t], dim=0)
+
+            cp_weights, cp_factors = _cp_decompose_tensor(
+                tensor=stacked,
+                rank=cp_rank,
+                n_iter_max=n_iter_max,
+                tol=tol,
+                init=init,
+                random_state=random_state,
+                als_init_modes=als_init_modes,
+                als_random_starts=als_random_starts,
+                als_verbose=als_verbose,
+            )
+
+            return cls(
+                activation=mlp.activation,
+                fc1_bias=mlp.fc1.bias.detach().clone(),
+                fc2_bias=mlp.fc2.bias.detach().clone(),
+                cp_weights=cp_weights,
+                cp_factors=cp_factors,
+                cache_policy=cache_policy,
+            )
+
+    def _factors(self) -> List[torch.Tensor]:
+        return [getattr(self, f"cp_factor_{i}") for i in range(self.cp_order)]
+
+    def set_cache_policy(self, cache_policy: str) -> None:
+        cache_policy = cache_policy.lower()
+        if cache_policy not in self.VALID_CACHE_POLICIES:
+            raise ValueError(
+                f"Invalid cache_policy='{cache_policy}'. "
+                f"Expected one of {sorted(self.VALID_CACHE_POLICIES)}."
+            )
+        self.cache_policy = cache_policy
+        self.clear_cache()
+
+    def clear_cache(self) -> None:
+        self._cached_fc1_weight = None
+        self._cached_fc2_weight = None
+        self._cache_device = None
+        self._cache_dtype = None
+
+    def _reconstruct_stacked(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        factors = [f.to(device=device, dtype=dtype) for f in self._factors()]
+        weights = self.cp_weights.to(device=device, dtype=dtype)
+        if len(factors) != 3:
+            raise RuntimeError(f"Expected 3 CP factors for stacked MLP, got {len(factors)}")
+        return torch.einsum("r,ar,br,cr->abc", weights, factors[0], factors[1], factors[2]).contiguous()
+
+    def _dense_weights(self, dtype: torch.dtype, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.cache_policy == "gpu":
+            cache_hit = (
+                self._cached_fc1_weight is not None
+                and self._cached_fc2_weight is not None
+                and self._cache_device == device
+                and self._cache_dtype == dtype
+            )
+            if not cache_hit:
+                stacked = self._reconstruct_stacked(dtype=dtype, device=device)
+                self._cached_fc1_weight = stacked[0]
+                self._cached_fc2_weight = stacked[1].T
+                self._cache_device = device
+                self._cache_dtype = dtype
+            return self._cached_fc1_weight, self._cached_fc2_weight
+
+        if self.cache_policy == "cpu":
+            cache_hit = self._cached_fc1_weight is not None and self._cached_fc2_weight is not None
+            if not cache_hit:
+                stacked_cpu = self._reconstruct_stacked(dtype=self.cp_weights.dtype, device=torch.device("cpu"))
+                self._cached_fc1_weight = stacked_cpu[0].contiguous()
+                self._cached_fc2_weight = stacked_cpu[1].T.contiguous()
+                self._cache_device = torch.device("cpu")
+                self._cache_dtype = self._cached_fc1_weight.dtype
+
+            return (
+                self._cached_fc1_weight.to(device=device, dtype=dtype),
+                self._cached_fc2_weight.to(device=device, dtype=dtype),
+            )
+
+        stacked = self._reconstruct_stacked(dtype=dtype, device=device)
+        return stacked[0], stacked[1].T
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        fc1_weight, fc2_weight = self._dense_weights(hidden_state.dtype, hidden_state.device)
+        fc1_bias = self.fc1_bias.to(device=hidden_state.device, dtype=hidden_state.dtype)
+        fc2_bias = self.fc2_bias.to(device=hidden_state.device, dtype=hidden_state.dtype)
+
+        hidden_state = nn.functional.linear(hidden_state, fc1_weight, fc1_bias)
+        hidden_state = self.activation(hidden_state)
+        hidden_state = nn.functional.linear(hidden_state, fc2_weight, fc2_bias)
+        return hidden_state
+
+    def cp_numel(self) -> int:
+        total = int(self.cp_weights.numel())
+        for factor in self._factors():
+            total += int(factor.numel())
+        return total
+
+
+class CPLinear(nn.Module):
+    """CP-backed replacement for a single nn.Linear layer with cache policy support."""
+
+    VALID_CACHE_POLICIES = {"none", "cpu", "gpu"}
+
+    def __init__(
+        self,
+        cp_weights: torch.Tensor,
+        cp_factors: List[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        cache_policy: str = "none",
+    ) -> None:
+        super().__init__()
+        self.register_buffer("cp_weights", cp_weights)
+        self.cp_order = int(len(cp_factors))
+        for idx, factor in enumerate(cp_factors):
+            self.register_buffer(f"cp_factor_{idx}", factor)
+
+        self.set_cache_policy(cache_policy)
+
+        if bias is not None:
+            self.register_buffer("bias", bias)
+        else:
+            self.bias = None
+
+        self._cached_weight: Optional[torch.Tensor] = None
+        self._cache_device: Optional[torch.device] = None
+        self._cache_dtype: Optional[torch.dtype] = None
+
+    @classmethod
+    def from_dense_linear(
+        cls,
+        linear: nn.Linear,
+        cp_rank: int,
+        n_iter_max: int = 100,
+        tol: float = 1e-8,
+        init: Union[str, Tuple[str, ...], List[str]] = "svd",
+        random_state: int = 0,
+        als_init_modes: Union[Tuple[str, ...], List[str]] = ("svd", "hosvd", "random"),
+        als_random_starts: int = 3,
+        als_verbose: bool = False,
+        cache_policy: str = "none",
+    ) -> "CPLinear":
+        with torch.no_grad():
+            weight = linear.weight.detach().clone()
+            cp_weights, cp_factors = _cp_decompose_tensor(
+                tensor=weight,
+                rank=cp_rank,
+                n_iter_max=n_iter_max,
+                tol=tol,
+                init=init,
+                random_state=random_state,
+                als_init_modes=als_init_modes,
+                als_random_starts=als_random_starts,
+                als_verbose=als_verbose,
+            )
+            bias = linear.bias.detach().clone() if linear.bias is not None else None
+            return cls(
+                cp_weights=cp_weights,
+                cp_factors=cp_factors,
+                bias=bias,
+                cache_policy=cache_policy,
+            )
+
+    def _factors(self) -> List[torch.Tensor]:
+        return [getattr(self, f"cp_factor_{i}") for i in range(self.cp_order)]
+
+    def set_cache_policy(self, cache_policy: str) -> None:
+        cache_policy = cache_policy.lower()
+        if cache_policy not in self.VALID_CACHE_POLICIES:
+            raise ValueError(
+                f"Invalid cache_policy='{cache_policy}'. "
+                f"Expected one of {sorted(self.VALID_CACHE_POLICIES)}."
+            )
+        self.cache_policy = cache_policy
+        self.clear_cache()
+
+    def clear_cache(self) -> None:
+        self._cached_weight = None
+        self._cache_device = None
+        self._cache_dtype = None
+
+    def _reconstruct_weight(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        factors = [f.to(device=device, dtype=dtype) for f in self._factors()]
+        weights = self.cp_weights.to(device=device, dtype=dtype)
+        if len(factors) != 2:
+            raise RuntimeError(f"Expected 2 CP factors for linear weight, got {len(factors)}")
+        return torch.einsum("r,or,ir->oi", weights, factors[0], factors[1]).contiguous()
+
+    def _dense_weight(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        if self.cache_policy == "gpu":
+            cache_hit = (
+                self._cached_weight is not None
+                and self._cache_device == device
+                and self._cache_dtype == dtype
+            )
+            if not cache_hit:
+                self._cached_weight = self._reconstruct_weight(dtype=dtype, device=device)
+                self._cache_device = device
+                self._cache_dtype = dtype
+            return self._cached_weight
+
+        if self.cache_policy == "cpu":
+            if self._cached_weight is None:
+                self._cached_weight = self._reconstruct_weight(dtype=self.cp_weights.dtype, device=torch.device("cpu"))
+                self._cache_device = torch.device("cpu")
+                self._cache_dtype = self._cached_weight.dtype
+            return self._cached_weight.to(device=device, dtype=dtype)
+
+        return self._reconstruct_weight(dtype=dtype, device=device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self._dense_weight(dtype=x.dtype, device=x.device)
+        bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
+        return nn.functional.linear(x, weight, bias)
+
+    def cp_numel(self) -> int:
+        total = int(self.cp_weights.numel())
+        for factor in self._factors():
+            total += int(factor.numel())
+        return total
+
+
+def build_cp_dinov2_mlp(
+    mlp: Dinov2WithRegistersMLP,
+    cp_rank: int,
+    n_iter_max: int = 100,
+    tol: float = 1e-8,
+    init: Union[str, Tuple[str, ...], List[str]] = "svd",
+    random_state: int = 0,
+    als_init_modes: Union[Tuple[str, ...], List[str]] = ("svd", "hosvd", "random"),
+    als_random_starts: int = 3,
+    als_verbose: bool = False,
+    cache_policy: str = "none",
+) -> CPDinov2WithRegistersMLP:
+    return CPDinov2WithRegistersMLP.from_dense_mlp(
+        mlp=mlp,
+        cp_rank=cp_rank,
+        n_iter_max=n_iter_max,
+        tol=tol,
+        init=init,
+        random_state=random_state,
+        als_init_modes=als_init_modes,
+        als_random_starts=als_random_starts,
+        als_verbose=als_verbose,
+        cache_policy=cache_policy,
+    )
+
+
+def build_cp_linear(
+    linear: nn.Linear,
+    cp_rank: int,
+    n_iter_max: int = 100,
+    tol: float = 1e-8,
+    init: Union[str, Tuple[str, ...], List[str]] = "svd",
+    random_state: int = 0,
+    als_init_modes: Union[Tuple[str, ...], List[str]] = ("svd", "hosvd", "random"),
+    als_random_starts: int = 3,
+    als_verbose: bool = False,
+    cache_policy: str = "none",
+) -> CPLinear:
+    return CPLinear.from_dense_linear(
+        linear=linear,
+        cp_rank=cp_rank,
+        n_iter_max=n_iter_max,
+        tol=tol,
+        init=init,
+        random_state=random_state,
+        als_init_modes=als_init_modes,
+        als_random_starts=als_random_starts,
+        als_verbose=als_verbose,
         cache_policy=cache_policy,
     )
 

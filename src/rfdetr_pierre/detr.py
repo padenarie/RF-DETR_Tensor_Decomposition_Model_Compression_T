@@ -149,6 +149,13 @@ class RFDETR:
         max_iter: int = None,
         tol: float = None,
         cache_policy: str = "none",
+        factorize_backbone_mlp: bool = True,
+        factorize_backbone_attention: bool = False,
+        factorize_decoder_ffn: bool = False,
+        decoder_layer_ids: Union[List[int], str, None] = None,
+        eps_backbone_mlp: float = None,
+        eps_backbone_attention: float = None,
+        eps_decoder_ffn: float = None,
         verbose: bool = True,
     ):
         """Replace selected DINOv2 MLP layers with TT-backed MLP modules.
@@ -161,6 +168,7 @@ class RFDETR:
             Dinov2WithRegistersMLP,
             TTDinov2WithRegistersMLP,
             build_tt_dinov2_mlp,
+            build_tt_linear,
         )
 
         try:
@@ -183,41 +191,149 @@ class RFDETR:
         replaced = 0
         skipped = 0
 
+        eps_backbone_mlp = eps if eps_backbone_mlp is None else eps_backbone_mlp
+        eps_backbone_attention = eps if eps_backbone_attention is None else eps_backbone_attention
+        eps_decoder_ffn = eps if eps_decoder_ffn is None else eps_decoder_ffn
+
         for idx in selected_layer_ids:
             layer = layers[idx]
             mlp = layer.mlp
 
-            if isinstance(mlp, TTDinov2WithRegistersMLP):
-                skipped += 1
-                if verbose:
-                    logger.info(f"Layer {idx}: already TT-factorized, skipping.")
-                continue
+            if factorize_backbone_mlp:
+                if isinstance(mlp, TTDinov2WithRegistersMLP):
+                    skipped += 1
+                    if verbose:
+                        logger.info(f"Layer {idx} MLP: already TT-factorized, skipping.")
+                else:
+                    if not isinstance(mlp, Dinov2WithRegistersMLP):
+                        raise TypeError(
+                            f"Layer {idx} has unsupported MLP type: {type(mlp).__name__}. "
+                            "Expected Dinov2WithRegistersMLP."
+                        )
 
-            if not isinstance(mlp, Dinov2WithRegistersMLP):
-                raise TypeError(
-                    f"Layer {idx} has unsupported MLP type: {type(mlp).__name__}. "
-                    "Expected Dinov2WithRegistersMLP."
-                )
+                    dense_numel = mlp.fc1.weight.numel() + mlp.fc2.weight.numel()
+                    tt_mlp = build_tt_dinov2_mlp(
+                        mlp=mlp,
+                        eps=eps_backbone_mlp,
+                        ranks_tt=ranks_tt,
+                        ranks_cp=ranks_cp,
+                        max_iter=max_iter,
+                        tol=tol,
+                        cache_policy=cache_policy,
+                    )
+                    layer.mlp = tt_mlp
+                    replaced += 1
 
-            dense_numel = mlp.fc1.weight.numel() + mlp.fc2.weight.numel()
-            tt_mlp = build_tt_dinov2_mlp(
-                mlp=mlp,
-                eps=eps,
-                ranks_tt=ranks_tt,
-                ranks_cp=ranks_cp,
-                max_iter=max_iter,
-                tol=tol,
-                cache_policy=cache_policy,
-            )
-            layer.mlp = tt_mlp
-            replaced += 1
+                    if verbose:
+                        tt_numel = tt_mlp.tt_numel()
+                        ratio = (dense_numel / tt_numel) if tt_numel > 0 else float("inf")
+                        logger.info(
+                            f"Layer {idx} MLP: TT factorized (dense={dense_numel}, tt={tt_numel}, compression={ratio:.2f}x)."
+                        )
 
-            if verbose:
-                tt_numel = tt_mlp.tt_numel()
-                ratio = (dense_numel / tt_numel) if tt_numel > 0 else float("inf")
-                logger.info(
-                    f"Layer {idx}: TT factorized (dense={dense_numel}, tt={tt_numel}, compression={ratio:.2f}x)."
-                )
+            if factorize_backbone_attention:
+                attn_self = layer.attention.attention
+                attn_out = layer.attention.output
+                attn_names = ["query", "key", "value"]
+
+                for name in attn_names:
+                    mod = getattr(attn_self, name)
+                    if mod.__class__.__name__ == "TTLinear":
+                        skipped += 1
+                        if verbose:
+                            logger.info(f"Layer {idx} attention.{name}: already TT-factorized, skipping.")
+                        continue
+
+                    dense_numel = mod.weight.numel()
+                    tt_mod = build_tt_linear(
+                        linear=mod,
+                        eps=eps_backbone_attention,
+                        ranks_tt=ranks_tt,
+                        ranks_cp=ranks_cp,
+                        max_iter=max_iter,
+                        tol=tol,
+                        cache_policy=cache_policy,
+                    )
+                    setattr(attn_self, name, tt_mod)
+                    replaced += 1
+                    if verbose:
+                        tt_numel = tt_mod.tt_numel()
+                        ratio = (dense_numel / tt_numel) if tt_numel > 0 else float("inf")
+                        logger.info(
+                            f"Layer {idx} attention.{name}: TT factorized (dense={dense_numel}, tt={tt_numel}, compression={ratio:.2f}x)."
+                        )
+
+                if hasattr(attn_out, "dense"):
+                    mod = attn_out.dense
+                    if mod.__class__.__name__ == "TTLinear":
+                        skipped += 1
+                        if verbose:
+                            logger.info(f"Layer {idx} attention.out: already TT-factorized, skipping.")
+                    else:
+                        dense_numel = mod.weight.numel()
+                        tt_mod = build_tt_linear(
+                            linear=mod,
+                            eps=eps_backbone_attention,
+                            ranks_tt=ranks_tt,
+                            ranks_cp=ranks_cp,
+                            max_iter=max_iter,
+                            tol=tol,
+                            cache_policy=cache_policy,
+                        )
+                        attn_out.dense = tt_mod
+                        replaced += 1
+                        if verbose:
+                            tt_numel = tt_mod.tt_numel()
+                            ratio = (dense_numel / tt_numel) if tt_numel > 0 else float("inf")
+                            logger.info(
+                                f"Layer {idx} attention.out: TT factorized (dense={dense_numel}, tt={tt_numel}, compression={ratio:.2f}x)."
+                            )
+
+        if factorize_decoder_ffn:
+            try:
+                decoder_layers = self.model.model.transformer.decoder.layers
+            except Exception as exc:
+                raise AttributeError("Could not locate decoder layers at model.model.transformer.decoder.layers") from exc
+
+            dec_len = len(decoder_layers)
+            if decoder_layer_ids is None or decoder_layer_ids == "all":
+                selected_decoder_ids = list(range(dec_len))
+            else:
+                selected_decoder_ids = list(decoder_layer_ids)
+
+            dec_invalid_ids = [i for i in selected_decoder_ids if i < 0 or i >= dec_len]
+            if dec_invalid_ids:
+                raise ValueError(f"Invalid decoder_layer_ids={dec_invalid_ids}. Expected values in [0, {dec_len - 1}].")
+
+            for idx in selected_decoder_ids:
+                dec_layer = decoder_layers[idx]
+                for name in ["linear1", "linear2"]:
+                    mod = getattr(dec_layer, name)
+                    if mod.__class__.__name__ == "TTLinear":
+                        skipped += 1
+                        if verbose:
+                            logger.info(f"Decoder layer {idx} {name}: already TT-factorized, skipping.")
+                        continue
+
+                    dense_numel = mod.weight.numel()
+                    tt_mod = build_tt_linear(
+                        linear=mod,
+                        eps=eps_decoder_ffn,
+                        ranks_tt=ranks_tt,
+                        ranks_cp=ranks_cp,
+                        max_iter=max_iter,
+                        tol=tol,
+                        cache_policy=cache_policy,
+                    )
+                    setattr(dec_layer, name, tt_mod)
+                    replaced += 1
+
+                    if verbose:
+                        tt_numel = tt_mod.tt_numel()
+                        ratio = (dense_numel / tt_numel) if tt_numel > 0 else float("inf")
+                        logger.info(
+                            f"Decoder layer {idx} {name}: TT factorized (dense={dense_numel}, tt={tt_numel}, compression={ratio:.2f}x)."
+                        )
 
         if replaced > 0:
             # Optimized inference model holds stale weights once layers are replaced.
@@ -225,6 +341,273 @@ class RFDETR:
 
         if verbose:
             logger.info(f"TT factorization complete: replaced={replaced}, skipped={skipped}.")
+
+        return self
+
+    def cp_factorize(
+        self,
+        cp_rank: int = 16,
+        layer_ids: Union[List[int], str, None] = None,
+        cache_policy: str = "none",
+        cp_variant: str = "standard",
+        factorize_backbone_mlp: bool = True,
+        factorize_backbone_attention: bool = False,
+        factorize_decoder_ffn: bool = False,
+        decoder_layer_ids: Union[List[int], str, None] = None,
+        n_iter_max: int = 100,
+        tol: float = 1e-8,
+        init: Union[List[str], str, tuple] = "svd",
+        random_state: int = 0,
+        als_init_modes: Union[List[str], tuple] = ("svd", "hosvd", "random"),
+        als_random_starts: int = 3,
+        als_verbose: bool = False,
+        verbose: bool = True,
+    ):
+        """Replace selected layers with CP-backed modules and configurable cache policy.
+
+        CP init options:
+            - init="svd" or init="random"
+            - init=("svd", "hosvd", "random") for multistart search
+            - als_init_modes/als_random_starts tune multistart behavior
+            - als_verbose prints per-start ALS progress and chosen best candidate
+
+        CP variants:
+            - cp_variant="standard": existing per-module CP-backed replacements
+            - cp_variant="layer_joint": per-layer joint CP over [fc1, fc2, q, k, v, out], dense write-back
+            - cp_variant="global_mlp": one global CP over all selected fc1/fc2, dense write-back
+        """
+        from rfdetr_pierre.models.backbone.dinov2_with_windowed_attn import (
+            CPDinov2WithRegistersMLP,
+            Dinov2WithRegistersMLP,
+            build_cp_dinov2_mlp,
+            build_cp_linear,
+            cp_approx_global_mlp_tensor,
+            cp_approx_layer_joint_tensor,
+        )
+
+        if cp_rank is None or int(cp_rank) < 1:
+            raise ValueError("cp_rank must be >= 1")
+
+        try:
+            layers = self.model.model.backbone[0].encoder.encoder.encoder.layer
+        except Exception as exc:
+            raise AttributeError(
+                "Could not locate DINOv2 backbone layers at model.model.backbone[0].encoder.encoder.encoder.layer"
+            ) from exc
+
+        num_layers = len(layers)
+        if layer_ids is None or layer_ids == "all":
+            selected_layer_ids = list(range(num_layers))
+        else:
+            selected_layer_ids = list(layer_ids)
+
+        invalid_ids = [i for i in selected_layer_ids if i < 0 or i >= num_layers]
+        if invalid_ids:
+            raise ValueError(f"Invalid layer_ids={invalid_ids}. Expected values in [0, {num_layers - 1}].")
+
+        replaced = 0
+        skipped = 0
+        cp_variant = str(cp_variant).lower()
+        if cp_variant not in {"standard", "layer_joint", "global_mlp"}:
+            raise ValueError("cp_variant must be one of {'standard', 'layer_joint', 'global_mlp'}")
+
+        if cp_variant == "global_mlp" and factorize_backbone_mlp and len(selected_layer_ids) > 0:
+            replaced += cp_approx_global_mlp_tensor(
+                layers=layers,
+                layer_ids=selected_layer_ids,
+                cp_rank=int(cp_rank),
+                n_iter_max=n_iter_max,
+                tol=tol,
+                init=init,
+                random_state=random_state,
+                als_init_modes=als_init_modes,
+                als_random_starts=als_random_starts,
+                als_verbose=als_verbose,
+            )
+
+            if verbose:
+                logger.info(
+                    "Global MLP CP variant applied on selected backbone layers (dense write-back of approximated weights)."
+                )
+
+        for idx in selected_layer_ids:
+            layer = layers[idx]
+            mlp = layer.mlp
+
+            if cp_variant == "layer_joint":
+                updated = cp_approx_layer_joint_tensor(
+                    layer=layer,
+                    cp_rank=int(cp_rank),
+                    n_iter_max=n_iter_max,
+                    tol=tol,
+                    init=init,
+                    random_state=random_state,
+                    als_init_modes=als_init_modes,
+                    als_random_starts=als_random_starts,
+                    als_verbose=als_verbose,
+                    include_mlp=bool(factorize_backbone_mlp),
+                    include_attention=bool(factorize_backbone_attention),
+                )
+                replaced += int(updated)
+                if verbose and updated > 0:
+                    logger.info(
+                        f"Layer {idx}: layer_joint CP variant updated {updated} matrices (dense write-back)."
+                    )
+                continue
+
+            if factorize_backbone_mlp and cp_variant != "global_mlp":
+                if isinstance(mlp, CPDinov2WithRegistersMLP):
+                    skipped += 1
+                    if verbose:
+                        logger.info(f"Layer {idx} MLP: already CP-factorized, skipping.")
+                else:
+                    if not isinstance(mlp, Dinov2WithRegistersMLP):
+                        raise TypeError(
+                            f"Layer {idx} has unsupported MLP type: {type(mlp).__name__}. "
+                            "Expected Dinov2WithRegistersMLP."
+                        )
+
+                    dense_numel = mlp.fc1.weight.numel() + mlp.fc2.weight.numel()
+                    cp_mlp = build_cp_dinov2_mlp(
+                        mlp=mlp,
+                        cp_rank=int(cp_rank),
+                        n_iter_max=n_iter_max,
+                        tol=tol,
+                        init=init,
+                        random_state=random_state,
+                        als_init_modes=als_init_modes,
+                        als_random_starts=als_random_starts,
+                        als_verbose=als_verbose,
+                        cache_policy=cache_policy,
+                    )
+                    layer.mlp = cp_mlp
+                    replaced += 1
+
+                    if verbose:
+                        cp_numel = cp_mlp.cp_numel()
+                        ratio = (dense_numel / cp_numel) if cp_numel > 0 else float("inf")
+                        logger.info(
+                            f"Layer {idx} MLP: CP factorized (dense={dense_numel}, cp={cp_numel}, compression={ratio:.2f}x)."
+                        )
+
+            if factorize_backbone_attention:
+                attn_self = layer.attention.attention
+                attn_out = layer.attention.output
+                attn_names = ["query", "key", "value"]
+
+                for name in attn_names:
+                    mod = getattr(attn_self, name)
+                    if mod.__class__.__name__ == "CPLinear":
+                        skipped += 1
+                        if verbose:
+                            logger.info(f"Layer {idx} attention.{name}: already CP-factorized, skipping.")
+                        continue
+
+                    dense_numel = mod.weight.numel()
+                    cp_mod = build_cp_linear(
+                        linear=mod,
+                        cp_rank=int(cp_rank),
+                        n_iter_max=n_iter_max,
+                        tol=tol,
+                        init=init,
+                        random_state=random_state,
+                        als_init_modes=als_init_modes,
+                        als_random_starts=als_random_starts,
+                        als_verbose=als_verbose,
+                        cache_policy=cache_policy,
+                    )
+                    setattr(attn_self, name, cp_mod)
+                    replaced += 1
+                    if verbose:
+                        cp_numel = cp_mod.cp_numel()
+                        ratio = (dense_numel / cp_numel) if cp_numel > 0 else float("inf")
+                        logger.info(
+                            f"Layer {idx} attention.{name}: CP factorized (dense={dense_numel}, cp={cp_numel}, compression={ratio:.2f}x)."
+                        )
+
+                if hasattr(attn_out, "dense"):
+                    mod = attn_out.dense
+                    if mod.__class__.__name__ == "CPLinear":
+                        skipped += 1
+                        if verbose:
+                            logger.info(f"Layer {idx} attention.out: already CP-factorized, skipping.")
+                    else:
+                        dense_numel = mod.weight.numel()
+                        cp_mod = build_cp_linear(
+                            linear=mod,
+                            cp_rank=int(cp_rank),
+                            n_iter_max=n_iter_max,
+                            tol=tol,
+                            init=init,
+                            random_state=random_state,
+                            als_init_modes=als_init_modes,
+                            als_random_starts=als_random_starts,
+                            als_verbose=als_verbose,
+                            cache_policy=cache_policy,
+                        )
+                        attn_out.dense = cp_mod
+                        replaced += 1
+                        if verbose:
+                            cp_numel = cp_mod.cp_numel()
+                            ratio = (dense_numel / cp_numel) if cp_numel > 0 else float("inf")
+                            logger.info(
+                                f"Layer {idx} attention.out: CP factorized (dense={dense_numel}, cp={cp_numel}, compression={ratio:.2f}x)."
+                            )
+
+        if factorize_decoder_ffn:
+            try:
+                decoder_layers = self.model.model.transformer.decoder.layers
+            except Exception as exc:
+                raise AttributeError("Could not locate decoder layers at model.model.transformer.decoder.layers") from exc
+
+            dec_len = len(decoder_layers)
+            if decoder_layer_ids is None or decoder_layer_ids == "all":
+                selected_decoder_ids = list(range(dec_len))
+            else:
+                selected_decoder_ids = list(decoder_layer_ids)
+
+            dec_invalid_ids = [i for i in selected_decoder_ids if i < 0 or i >= dec_len]
+            if dec_invalid_ids:
+                raise ValueError(f"Invalid decoder_layer_ids={dec_invalid_ids}. Expected values in [0, {dec_len - 1}].")
+
+            for idx in selected_decoder_ids:
+                dec_layer = decoder_layers[idx]
+                for name in ["linear1", "linear2"]:
+                    mod = getattr(dec_layer, name)
+                    if mod.__class__.__name__ == "CPLinear":
+                        skipped += 1
+                        if verbose:
+                            logger.info(f"Decoder layer {idx} {name}: already CP-factorized, skipping.")
+                        continue
+
+                    dense_numel = mod.weight.numel()
+                    cp_mod = build_cp_linear(
+                        linear=mod,
+                        cp_rank=int(cp_rank),
+                        n_iter_max=n_iter_max,
+                        tol=tol,
+                        init=init,
+                        random_state=random_state,
+                        als_init_modes=als_init_modes,
+                        als_random_starts=als_random_starts,
+                        als_verbose=als_verbose,
+                        cache_policy=cache_policy,
+                    )
+                    setattr(dec_layer, name, cp_mod)
+                    replaced += 1
+
+                    if verbose:
+                        cp_numel = cp_mod.cp_numel()
+                        ratio = (dense_numel / cp_numel) if cp_numel > 0 else float("inf")
+                        logger.info(
+                            f"Decoder layer {idx} {name}: CP factorized (dense={dense_numel}, cp={cp_numel}, compression={ratio:.2f}x)."
+                        )
+
+        if replaced > 0:
+            self.remove_optimized_model()
+
+        if verbose:
+            logger.info(f"CP factorization complete: replaced={replaced}, skipped={skipped}.")
 
         return self
 
