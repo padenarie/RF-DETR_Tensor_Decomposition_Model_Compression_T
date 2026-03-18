@@ -182,3 +182,11 @@ cython_debug/
 rf-detr-seg-nano.pt
 data/processed/football_play_decomposed.mp4
 /data/processed
+
+
+# downloaded models
+notebooks/rf-detr-nano.pth
+notebooks/rf-detr-seg-medium.pt
+notebooks/rf-detr-seg-nano.pt
+notebooks/*.pt
+notebooks/*.pth
