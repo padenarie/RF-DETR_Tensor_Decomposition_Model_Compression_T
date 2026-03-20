@@ -1,6 +1,6 @@
 # Soccer Broadcast AI — RF-DETR with Tensor Decomposition
 
-A research pipeline for **soccer broadcast video analytics** using a heavily customised version of [RF-DETR](https://github.com/roboflow/rf-detr) with a DINOv2 backbone, extended with two families of **neural network compression via tensor decomposition**: Tensor Train (TT) and CP (CANDECOMP/PARAFAC) combined with Quantization at varying bit-floating points.
+A research pipeline for **neural network compression** applied to soccer broadcast image segmentation, using a heavily customised version of [RF-DETR](https://github.com/roboflow/rf-detr) with a DINOv2 backbone. The pipeline explores three compression strategies: **Tensor Train (TT) decomposition**, **CP (CANDECOMP/PARAFAC) decomposition**, and **low-precision core quantization** (FP16 / BF16 / FP8).
 
 ---
 
@@ -18,14 +18,15 @@ A research pipeline for **soccer broadcast video analytics** using a heavily cus
 | CP — Rank 16 (layers 8 – 11) | ~45 % | ~45 % | +5 – 20 % |
 | **TT (MLP, `ε = 0.3`) + FP16 cores** | ~40 % | **~20 % 🔻** | +5 – 15 % |
 | **TT (MLP, `ε = 0.3`) + BF16 cores** | ~40 % | **~20 % 🔻** | +5 – 15 % |
+| TT (MLP, `ε = 0.3`) + FP8 cores | ~40 % | **~10 % 🔻** | GPU only (H100 / Ada) |
 
 ### 🥇 Best Combined Result
 
 > **TT (`ε = 0.3`, MLP layers 8 – 11) + FP16 core storage → ~5× backbone memory compression**  
 > Detection quality remains comparable to the full-precision baseline; the `.predict()` API is unchanged.
 
-> ⚠️ FP16 / BF16 memory savings apply to stored core tensors only. On CPU, cores are temporarily upcast to FP32
-> during TT contraction — compute therefore always runs in FP32. See [§8 Disclaimer](#8-️-production-readiness-disclaimer).
+> ⚠️ FP16 / BF16 / FP8 memory savings apply to stored core tensors only. On CPU, cores are temporarily upcast to FP32
+> during TT contraction — compute therefore always runs in FP32. FP8 formats require H100 / Ada GPUs. See [§8 Disclaimer](#8-️-production-readiness-disclaimer).
 
 ---
 
@@ -38,7 +39,7 @@ A research pipeline for **soccer broadcast video analytics** using a heavily cus
    - [4.1 Tensor Train (TT)](#41-tensor-train-tt-decomposition)
    - [4.2 CP Decomposition](#42-cp-candecompparafac-decomposition)
    - [4.3 Compression Strategy for DINOv2 MLP Weights](#43-compression-strategy-for-dinov2-mlp-weights)
-   - [4.4 TT + Core Quantization (FP16 / BF16)](#44-tt--core-quantization-fp16--bf16)
+   - [4.4 TT + Core Quantization (FP16 / BF16 / FP8)](#44-tt--core-quantization-fp16--bf16--fp8)
 5. [Model Variants](#5-model-variants)
 6. [Quick Start](#6-quick-start)
 7. [Notebooks](#7-notebooks)
@@ -245,16 +246,28 @@ The recommended workflow for finding the best compressed model:
 
 ---
 
-### 4.4 TT + Core Quantization (FP16 / BF16)
+### 4.4 TT + Core Quantization (FP16 / BF16 / FP8)
 
-After TT compression, the individual TT core tensors can be **cast to a lower-precision dtype** (FP16 or BF16) to achieve a further **~2× reduction in stored bytes** with negligible impact on reconstruction quality.
+After TT compression, the individual TT core tensors can be **cast to a lower-precision dtype** to achieve a further **2–4× reduction in stored bytes** with negligible impact on reconstruction quality.
 
 **How it works:**
-- TT cores are stored as `torch.float16` or `torch.bfloat16` tensors (2 bytes/element vs 4)
+- TT cores are stored in a reduced-precision dtype (2 bytes/element for FP16/BF16, 1 byte for FP8 — vs 4 for FP32)
 - During the forward pass, cores are temporarily upcast to `float32` for the TT contraction chain (batched einsum / matmul), then the reconstructed weight matrix is cast to the desired compute dtype
 - Memory savings are real for model storage and transfer; on CPU, the einsum contraction always runs in FP32
 
-**Cumulative memory reduction table:**
+#### Dtypes compared
+
+| Core dtype | Bytes / value | Dynamic range | Notes |
+|-----------|---------------|---------------|-------|
+| `float32` | 4 | ±3.4×10³⁸ | Default |
+| `float16` | 2 | ±65 504 | Fast on GPU; slow on CPU |
+| `bfloat16` | 2 | ±3.4×10³⁸ | Good on CPU (AVX-512 BF16) |
+| `float8_e4m3fn` | 1 | ±448 | 4-exp / 3-mantissa bits; finite-only; for weights & activations; **GPU only (H100 / Ada)** |
+| `float8_e5m2` | 1 | ±57 344 | 5-exp / 2-mantissa bits; wider range; for gradients; **GPU only (H100 / Ada)** |
+
+> **Note on CPU (our environment):** PyTorch CPU float16 matmuls lack hardware acceleration on most machines, so latency may *increase* despite the memory saving. bfloat16 is typically better supported on modern Intel/AMD CPUs. The FP8 formats require an H100 / Ada-generation GPU. The memory win is real regardless of latency.
+
+#### Cumulative memory reduction
 
 | Stage | Memory vs FP32 baseline |
 |-------|--------------------------|
@@ -262,18 +275,21 @@ After TT compression, the individual TT core tensors can be **cast to a lower-pr
 | After TT (`ε = 0.3`, MLP layers 8 – 11) | ~40 % |
 | + FP16 core storage | **~20 %** (≈ 5× total reduction) |
 | + BF16 core storage | **~20 %** (≈ 5× total reduction) |
+| + FP8 core storage | **~10 %** (≈ 10× total reduction) |
 
 **API (see §9 of `tensor_decomposition_showcase.ipynb`):**
 
 ```python
 QUANT_CONFIGS = [
-    {"name": "TT-FP32", "core_dtype": torch.float32},
-    {"name": "TT-FP16", "core_dtype": torch.float16},
-    {"name": "TT-BF16", "core_dtype": torch.bfloat16},
+    ("TT fp32",         None),                 # baseline — no quantization
+    ("TT + FP16",       torch.float16),
+    ("TT + BF16",       torch.bfloat16),
+    ("TT + FP8_e4m3fn", torch.float8_e4m3fn),  # GPU only (H100 / Ada)
+    ("TT + FP8_e5m2",   torch.float8_e5m2),    # GPU only (H100 / Ada)
 ]
 ```
 
-The automated sweep in the showcase notebook evaluates all three configs on `dog.jpg`, selects the best by a combined score of compression ratio × detection quality, and passes the winner directly to the video segmentation section.
+The automated sweep in the showcase notebook evaluates all five configs on `dog.jpg`, selects the best by a combined score of compression ratio × detection quality, and passes the winner directly to the video segmentation section (§10).
 
 > **Note:** True mixed-precision TT contraction (FP16 einsum) requires structural changes to tntorch's contraction kernels or GPU execution. The upcast-on-contraction approach is a CPU research workaround — see [§8 Disclaimer](#8-️-production-readiness-disclaimer).
 
@@ -397,4 +413,6 @@ def _patched_dense_weights(self_m, compute_dtype, device):
 - **CP/PARAFAC**: Carroll & Chang, 1970; Harshman, 1970
 - **TensorLy**: Kossaifi et al., 2019 — [tensorly.org](http://tensorly.org)
 - **tntorch**: Alberini & Sanz-Alonso, 2021 — [github.com/rballester/tntorch](https://github.com/rballester/tntorch) (forked as `tntorch_pierre`)
+
+
 
