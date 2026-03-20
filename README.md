@@ -1,6 +1,6 @@
 # Soccer Broadcast AI — RF-DETR with Tensor Decomposition
 
-A research pipeline for **soccer broadcast video analytics** using a heavily customised version of [RF-DETR](https://github.com/roboflow/rf-detr) with a DINOv2 backbone, extended with two families of **neural network compression via tensor decomposition**: Tensor Train (TT) and CP (CANDECOMP/PARAFAC).
+A research pipeline for **soccer broadcast video analytics** using a heavily customised version of [RF-DETR](https://github.com/roboflow/rf-detr) with a DINOv2 backbone, extended with two families of **neural network compression via tensor decomposition**: Tensor Train (TT) and CP (CANDECOMP/PARAFAC) combined with Quantization at varying bit-floating points.
 
 ---
 
